@@ -1,0 +1,525 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFormation Template for MAP 2.0 Tag Conformance Pack (gs-map20tagging)
+
+  **WARNING** This template creates AWS Config rules and related resources.
+  You will be billed for the AWS resources used if you create a stack from this
+  template.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Amazon S3 bucket configuration"
+        Parameters:
+          - ConformancePackDeliveryBucket
+          - ZipBucketName
+          - ZipFilePath
+      -
+        Label:
+          default: "MAP 2.0 Tag value configuration"
+        Parameters:
+          - TagValue
+          - MapSignDate
+    ParameterLabels:
+      ConformancePackDeliveryBucket:
+        default: "AWS Config conformance pack Amazon S3 delivery bucket"
+      ZipBucketName:
+        default: "Amazon S3 bucket hosting the zip file"
+      ZipFilePath:
+        default: "Path of the zip file"
+      TagValue:
+        default: "MAP 2.0 Tag Value"
+      MapSignDate:
+        default: "MAP 2.0 Sign date"
+
+Parameters:
+  ZipBucketName:
+    Description: The name of the Amazon S3 bucket to which the zip file was uploaded
+    Type: String
+  ZipFilePath:
+    Description: Full path of the of the zip file including the file name.
+    Type: String
+    AllowedPattern: .*(\.zip)$
+    Default: check_map_tags.zip
+  ConformancePackDeliveryBucket:
+    Description: The name of the Amazon S3 bucket where AWS Config stores conformance pack templates
+    Type: String
+  TagValue:
+    Description: Tag Value to be used for MAP 2.0
+    Type: String
+  MapSignDate:
+    Description: MAP 2.0 Sign date in YYYY-MM-DD format
+    Type: String
+    AllowedPattern: ^\d{4}\-(0[1-9]|1[012])\-(0[1-9]|[12][0-9]|3[01])$
+
+Resources:
+  CustomRuleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: check_map_tags.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref ZipBucketName
+        S3Key: !Ref ZipFilePath
+      Runtime: python3.9
+      Timeout: 180
+      MemorySize: 256
+      Architectures:
+        - arm64
+
+  CustomRuleLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref CustomRuleLambda]]
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfigRulePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: "2"
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Effect: Allow
+                Resource: "*"
+              - Sid: "3"
+                Action:
+                  - config:PutEvaluations
+                Effect: Allow
+                Resource: "*"
+              - Sid: "4"
+                Action:
+                  - iam:List*
+                  - iam:Describe*
+                  - iam:Get*
+                Effect: Allow
+                Resource: "*"
+              - Sid: "5"
+                Action:
+                  - sts:AssumeRole
+                Effect: Allow
+                Resource: "*"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess
+  ConfigPermissionToCallCustomLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CustomRuleLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  RemediationDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        description: This document takes in input as Resource ID. It resolved the Resource ID to an Resource ARN and then adds/updates the map-migrated tag for that resource.
+        schemaVersion: "0.3"
+        parameters:
+          resourceId:
+            type: String
+            description: Resource ID
+          tagValue:
+            type: String
+            description: Value of map-migrated tag
+        mainSteps:
+          - name: GetResrouceARN
+            action: "aws:executeAwsApi"
+            inputs:
+              Service: config
+              Api: SelectResourceConfig
+              Expression: 'SELECT arn WHERE resourceId = ''{{resourceId}}'''
+            description: This step gets the Resource ARN given the Resource ID
+            outputs:
+              - Name: result
+                Selector: "$.Results[0]"
+                Type: String
+          - name: ExtractARN
+            action: "aws:executeScript"
+            inputs:
+              Runtime: python3.6
+              Handler: script_handler
+              Script: |-
+                def script_handler(events, context):
+                  import json
+                  result = events['result']
+                  json_result = json.loads(result)
+                  arn = json_result['arn']
+                  return {'arn': arn}
+              InputPayload:
+                result: "{{GetResrouceARN.result}}"
+            outputs:
+              - Name: arn
+                Selector: $.Payload.arn
+                Type: String
+            description: Extract the ARN from the API response
+          - name: TagResource
+            action: "aws:executeAwsApi"
+            inputs:
+              Service: resourcegroupstaggingapi
+              Api: TagResources
+              ResourceARNList:
+                - "{{ExtractARN.arn}}"
+              Tags:
+                map-migrated: "{{tagValue}}"
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Name: MapTaggingRemediationDoc
+
+  ConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn: ConfigPermissionToCallCustomLambda
+    Properties:
+      ConformancePackName: Map20-Tag-Conformance-Pack
+      ConformancePackInputParameters:
+      -
+        ParameterName: tagValue
+        ParameterValue: !Ref TagValue
+      -
+        ParameterName: mapSignDate
+        ParameterValue: !Ref MapSignDate
+      -
+        ParameterName: CustomRuleLambdaArn
+        ParameterValue: !GetAtt CustomRuleLambda.Arn
+      -
+        ParameterName: RemediationDoc
+        ParameterValue: !Ref RemediationDoc
+      DeliveryS3Bucket: !Ref ConformancePackDeliveryBucket
+      TemplateBody: |-
+        Parameters:
+          tagValue:
+            Description: MAP 2.0 Tag Value.
+            Type: String
+          mapSignDate:
+            Description: MAP 2.0 Sign date in YYYY-MM-DD format.
+            Type: String
+          CustomRuleLambdaArn:
+            Description: ARN of the AWS Lambda function for the AWS Config custom rule.
+            Type: String
+          RemediationDoc:
+            Description: Name of the AWS Systems Manager Automation runbook used for the remdiation action.
+            Type: String
+        Resources:
+
+          MAPConfigRuleBackup:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-backup-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to AWS Backup resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::Backup::BackupPlan"
+                  - "AWS::Backup::BackupVault"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          MAPConfigRuleDynamoDB:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-dynamodb-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to DynamoDB resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::DynamoDB::Table"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          MAPConfigRuleRDS:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-rds-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to RDS resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::RDS::DBCluster"
+                  - "AWS::RDS::DBInstance"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          MAPConfigRuleElasticLoadBalancing:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-elb-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to ELB resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::ElasticLoadBalancing::LoadBalancer"
+                  - "AWS::ElasticLoadBalancingV2::LoadBalancer"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          MAPConfigRuleApiGateway:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-apigw-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to API Gateway resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::ApiGatewayV2::Api"
+                  - "AWS::ApiGateway::RestApi"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          MAPConfigRuleS3:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-s3-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to S3 resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::S3::Bucket"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          MAPConfigRuleEC2:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: "map20-tag-ec2-rule"
+                Description: "A rule which checks if correct MAP2.0 tags are assigned to EC2 resources in this account"
+                Scope:
+                  ComplianceResourceTypes:
+                  - "AWS::EC2::Instance"
+                  - "AWS::EC2::Volume"
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref CustomRuleLambdaArn
+                  SourceDetails:
+                    -
+                      EventSource: "aws.config"
+                      MessageType: "ConfigurationItemChangeNotification"
+                    -
+                      EventSource: aws.config
+                      MessageType: OversizedConfigurationItemChangeNotification
+
+                InputParameters:
+                  tagValue: !Ref tagValue
+                  mapSignDate: !Ref mapSignDate
+
+          RuleRemediationBackup:
+            DependsOn: MAPConfigRuleBackup
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-backup-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
+
+          RuleRemediationDynamoDB:
+            DependsOn: MAPConfigRuleDynamoDB
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-dynamodb-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
+
+          RuleRemediationRDS:
+            DependsOn: MAPConfigRuleRDS
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-rds-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
+
+          RuleRemediationElasticLoadBalancing:
+            DependsOn: MAPConfigRuleElasticLoadBalancing
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-elb-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
+
+          RuleRemediationApiGateway:
+            DependsOn: MAPConfigRuleApiGateway
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-apigw-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
+
+          RuleRemediationS3:
+            DependsOn: MAPConfigRuleS3
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-s3-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
+
+          RuleRemediationEC2:
+            DependsOn: MAPConfigRuleEC2
+            Type: AWS::Config::RemediationConfiguration
+            Properties:
+              Automatic: "false"
+              ConfigRuleName: map20-tag-ec2-rule
+              MaximumAutomaticAttempts: 3
+              Parameters:
+                resourceId:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+                tagValue:
+                  StaticValue:
+                    Values:
+                    - !Ref tagValue
+              RetryAttemptSeconds: 120
+              TargetId: !Ref RemediationDoc
+              TargetType: "SSM_DOCUMENT"
+              TargetVersion: "1"
