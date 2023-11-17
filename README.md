@@ -16,7 +16,7 @@ This Conformance Pack is applicable only to customers that have signed a MAP dea
 
 The AWS Config rules in this conformance pack will check compliance based on the following rules:
 1. **Not Applicable**: When the resource does not qualify for MAP 2.0 credits or is created before the MAP signing date.
-2. **Compliant**: The resource qualifies for MAP 2.0 credits, is created before the MAP signing date and has a map-migrated tag with the correct value.
+2. **Compliant**: The resource qualifies for MAP 2.0 credits, is created after the MAP signing date and has a map-migrated tag with the correct value.
 3. **Noncompliant**: in all other cases.
 
 This conformance pack checks for compliance on the following resource types:
